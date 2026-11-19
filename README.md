@@ -35,6 +35,8 @@ IBKR 网页端 → 业绩和报告 → 报表 → 活动 → 选择期间，格�
 npm test
 ```
 
+GitHub Actions 会在每次推送和 PR 时跑测试；推送到 `main` 后自动部署到 Cloudflare（需要在仓库 secrets 里配置 `CLOUDFLARE_API_TOKEN` 和 `CLOUDFLARE_ACCOUNT_ID`，没配置时跳过部署）。
+
 架构、行情缓存和复权的细节见 [docs/design.md](docs/design.md)。
 
 ## 说明

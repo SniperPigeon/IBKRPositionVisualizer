@@ -13,6 +13,7 @@ cache/
 # Node / Cloudflare
 node_modules/
 .wrangler/
+dist/
 npm-debug.log*
 
 # Python

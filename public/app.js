@@ -1,11 +1,13 @@
 /* IBKR 交易回看 — 在 K 线上标注买卖点
- * 账单 CSV 在浏览器里解析；行情经本地 server.py 从 Yahoo 获取并缓存。 */
-'use strict';
-(() => {
+ * 账单 CSV 只在浏览器里解析；行情通过 /api/chart 分块获取（Cloudflare Worker 或本地 server.py，接口相同）。 */
+import { chunkQueries, chunkPeriodEnd } from './lib/chunks.js';
+import { dayOf, toWall, wallToEpoch, parseYahoo, assemble, makeFactors, scaleBars, aggregate } from './lib/series.js';
+
 const LWC = window.LightweightCharts;
 const STATEMENT_TZ = 'America/New_York';   // IBKR 活动账单里的时间是美东时间
 const MA_PERIODS = [5, 10, 20, 30];
-const IV_SEC = { '60m': 3600, '15m': 900, '5m': 300 };
+const IV_SEC = { '60m': 3600, '30m': 1800 };
+const IVS = ['1d', '1wk', '1mo', '60m', '30m'];
 const DAY = 86400;
 
 // ---------------------------------------------------------------- utils
@@ -25,26 +27,9 @@ const store = {
   set(k, v) { try { localStorage.setItem('ibv.' + k, JSON.stringify(v)); } catch { /* private mode */ } },
 };
 const WEEK = '日一二三四五六';
-// "wall" 时间 = 某时区的本地时钟读数，按 UTC 存成秒（图表库按 UTC 显示，正好显示交易所本地时间）
 const wd = (sec) => { const d = new Date(sec * 1000); return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate(), H: d.getUTCHours(), M: d.getUTCMinutes(), w: d.getUTCDay() }; };
 const dateStr = (sec) => { const x = wd(sec); return `${x.y}-${pad(x.m)}-${pad(x.d)}`; };
 const timeStr = (sec) => { const x = wd(sec); return `${pad(x.H)}:${pad(x.M)}`; };
-const dayOf = (sec) => Math.floor(sec / DAY) * DAY;
-
-const tzFmts = new Map(), tzOffs = new Map();
-function rawWall(epoch, tz) {
-  let f = tzFmts.get(tz);
-  if (!f) { f = new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }); tzFmts.set(tz, f); }
-  const p = {}; for (const { type, value } of f.formatToParts(new Date(epoch * 1000))) p[type] = value;
-  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second) / 1000;
-}
-function toWall(epoch, tz) {           // 时区偏移在同一个 UTC 小时内不变，按小时缓存
-  const h = Math.floor(epoch / 3600), k = tz + h;
-  let o = tzOffs.get(k);
-  if (o === undefined) { o = rawWall(h * 3600, tz) - h * 3600; tzOffs.set(k, o); }
-  return epoch + o;
-}
-function wallToEpoch(wall, tz) { let e = wall; for (let i = 0; i < 3; i++) e = wall - (toWall(e, tz) - e); return e; }
 function parseWall(s) {
   const m = String(s ?? '').match(/(\d{4})-?(\d{2})-?(\d{2})(?:[,;\sT]+(\d{1,2}):?(\d{2}):?(\d{2})?)?/);
   return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)) / 1000 : NaN;
@@ -168,8 +153,11 @@ function parseFlat(rows, name) {
 // ---------------------------------------------------------------- model
 const S = {
   trades: [], transfers: [], positions: {}, info: {}, account: {}, files: [], seen: new Set(), asOf: {},
-  insts: new Map(), cur: null, iv: store.get('iv', '1d'),
-  bars: [], daily: [], tz: STATEMENT_TZ, splits: [], meta: {}, groups: new Map(), ind: null, pos: null, src: null, hl: null,
+  insts: new Map(), cur: null,
+  iv: IVS.includes(store.get('iv', '1d')) ? store.get('iv', '1d') : '1d',
+  adj: store.get('adj', 'qfq') === 'none' ? 'none' : 'qfq',
+  rawDaily: [], rawIntra: null, F: null, daily: [], bars: [], tz: STATEMENT_TZ, meta: {}, chunks: [],
+  groups: new Map(), ind: null, pos: null, hl: null, outOfRange: 0,
 };
 const overrides = store.get('yahoo', {});
 
@@ -199,7 +187,7 @@ function ingest(res) {
   const latest = !S.asOf.positions || gen >= S.asOf.positions;
   if (latest && res.positions.length + res.trades.length) {
     S.asOf.positions = gen; S.positions = {};
-    for (const p of res.positions) S.positions[p.sym] = { ...p, asOf: gen };
+    for (const p of res.positions) S.positions[p.sym] = { ...p, asOf: wallToEpoch(gen, STATEMENT_TZ) };
     S.account = { ...S.account, ...res.account };
   } else {
     S.account = { ...res.account, ...S.account };
@@ -210,7 +198,7 @@ function ingest(res) {
 
 function yahooSymbol(x) {
   if (x.kind === 'fx') { const [b, q] = x.key.split('.'); return `${b}${q}=X`; }
-  const s = x.key.replace(/\s+/g, '-');
+  const s = x.key.replace(/\s+/g, '-').toUpperCase();
   const ex = (x.exch || '').toUpperCase();
   if (x.cur === 'HKD' || ex === 'SEHK') return s.padStart(4, '0') + '.HK';
   if (x.cur === 'SGD' || ex === 'SGX') return s + '.SI';
@@ -251,6 +239,17 @@ function buildInstruments() {
   }
   S.insts = m;
 }
+
+// ---------------------------------------------------------------- 复权口径
+// 交易日（交易所时区）。美股 20:00 ET 之后的隔夜盘算下一个交易日。
+function tradeDay(epoch) {
+  const w = toWall(epoch, S.tz);
+  return dayOf(w) + (S.tz === 'America/New_York' && wd(w).H >= 20 ? DAY : 0);
+}
+const qfq = () => S.adj === 'qfq' && S.F;
+const viewP = (day) => (qfq() ? S.F.price(day) : 1);          // 显示价格 = 原始价 × viewP
+const viewV = (day) => (qfq() ? S.F.vol(day) : 1);            // 显示数量 = 原始数量 × viewV
+const unitV = (day) => (S.F ? S.F.vol(day) : 1);              // 换算成“最新股数”（与视图无关，用于持仓）
 
 // ---------------------------------------------------------------- sidebar / header
 function renderAcct() {
@@ -298,12 +297,13 @@ function renderSide() {
   $('#symlist').innerHTML = h || '<li class="grp">没有匹配的代码</li>';
 }
 
+const digits = (x) => (x && x.kind === 'fx' ? 4 : 2);
 function renderHeader() {
   const x = S.insts.get(S.cur); if (!x) return;
   $('#hSym').textContent = x.key;
   $('#hName').textContent = x.name || S.meta.longName || S.meta.shortName || '';
   $('#ysym').value = x.yahoo;
-  const d = S.daily, n = d.length, dg = digits(x);
+  const d = S.rawDaily, n = d.length, dg = digits(x);
   if (n >= 2) {
     const c = d[n - 1].close, p = d[n - 2].close, ch = c - p;
     $('#hPx').textContent = fmt(c, dg);
@@ -316,9 +316,11 @@ function renderHeader() {
     const hold = Math.abs(x.pos) > 1e-9;
     st.push(['持仓', hold ? `${fmtQ(x.pos)} 股` : '已清仓', '']);
     if (hold && Number.isFinite(x.cost)) {
-      st.push(['成本', fmt(x.cost / splitFactor(x.posAsOf), dg), '']);
-      const upl = (last - x.cost / splitFactor(x.posAsOf)) * x.pos * splitFactor(x.posAsOf);
-      st.push(['浮动盈亏', `${fmtS(upl)} (${fmtS(((last * splitFactor(x.posAsOf)) / x.cost - 1) * 100)}%)`, cls(upl)]);
+      // 账单里的成本价是账单日的原始价；若之后又拆股，换算成最新股数口径
+      const u = unitV(tradeDay(x.posAsOf));
+      const cost = x.cost / u, upl = (last - cost) * x.pos * u;
+      st.push(['成本', fmt(cost, dg), '']);
+      st.push(['浮动盈亏', `${fmtS(upl)} (${fmtS((last / cost - 1) * 100)}%)`, cls(upl)]);
     }
     st.push(['已实现', fmtS(x.realized), cls(x.realized)]);
     if (x.opts.length) st.push(['期权已实现', fmtS(x.optRealized), cls(x.optRealized)]);
@@ -327,56 +329,37 @@ function renderHeader() {
   if (x.closes) st.push(['胜率', `${Math.round((x.wins / x.closes) * 100)}% (${x.wins}/${x.closes})`, '']);
   $('#stats').innerHTML = st.map(([k, v, c]) => `<div class="stat"><span class="k">${k}</span><span class="v num ${c}">${v}</span></div>`).join('');
 }
-const digits = (x) => (x && x.kind === 'fx' ? 4 : 2);
 
 // ---------------------------------------------------------------- data
 const memo = new Map();
-async function fetchSeries(sym, iv, p1, refresh) {
-  const k = `${sym}|${iv}`, hit = memo.get(k);
-  if (!refresh && hit && Date.now() - hit.at < 60_000 && hit.p1 <= p1) return hit.data;
-  const r = await fetch(`/api/chart?symbol=${encodeURIComponent(sym)}&interval=${iv}&period1=${Math.floor(p1)}${refresh ? '&refresh=1' : ''}`);
-  let js; try { js = await r.json(); } catch { throw new Error(`行情服务返回异常 (HTTP ${r.status})`); }
-  if (!r.ok) throw new Error(js.error || `HTTP ${r.status}`);
-  memo.set(k, { at: Date.now(), p1, data: js });
-  return js;
-}
-
-function toBars(js, daily) {
-  const tz = js.meta.exchangeTimezoneName || STATEMENT_TZ;
-  const out = [];
-  for (const [t, o, h, l, c, v] of js.bars) {
-    const w = toWall(t, tz), time = daily ? dayOf(w) : w;
-    const b = { time, open: o, high: h, low: l, close: c, volume: v };
-    const last = out[out.length - 1];
-    if (last && time <= last.time) { if (time === last.time) out[out.length - 1] = b; continue; }
-    out.push(b);
+async function fetchChunk(qs, fresh) {
+  const url = '/api/chart?' + qs;
+  const hist = qs.includes('part=hist');
+  const hit = memo.get(url);
+  if (hit && !(fresh && !hist) && (hist || Date.now() - hit.at < 60_000)) return hit.chunk;
+  const r = await fetch(url, fresh && !hist ? { cache: 'reload' } : undefined);
+  if (r.status === 404) {
+    const chunk = { ...parseYahoo(null, 0), notFound: true };
+    memo.set(url, { at: Date.now(), chunk });
+    return chunk;
   }
-  const splits = (js.splits || []).map(([t, n, d]) => ({ day: dayOf(toWall(t, tz)), ratio: n / d })).filter((s) => s.ratio > 0);
-  return { bars: out, tz, splits };
-}
-function aggregate(d, iv) {
-  const key = iv === '1wk' ? (t) => t - ((wd(t).w + 6) % 7) * DAY : (t) => { const x = wd(t); return Date.UTC(x.y, x.m - 1, 1) / 1000; };
-  const out = []; let cur = null, ck = null;
-  for (const b of d) {
-    const k = key(b.time);
-    if (k !== ck) { if (cur) out.push(cur); ck = k; cur = { ...b }; }
-    else { cur.high = Math.max(cur.high, b.high); cur.low = Math.min(cur.low, b.low); cur.close = b.close; cur.volume += b.volume; }
+  if (!r.ok) {
+    let body = {};
+    try { body = await r.json(); } catch { /* not json */ }
+    const err = new Error(body.error || `HTTP ${r.status}`);
+    err.status = r.status; err.reason = body.reason;
+    err.retryAfter = Number(r.headers.get('retry-after')) || body.retryAfter || 0;
+    throw err;
   }
-  if (cur) out.push(cur);
-  return out;
+  const asOf = Number(r.headers.get('x-as-of')) || Math.floor(Date.now() / 1000);
+  const chunk = parseYahoo(await r.json(), asOf);
+  chunk.periodEnd = chunkPeriodEnd(qs, asOf);
+  chunk.source = r.headers.get('cf-cache-status') || r.headers.get('x-source') || '';
+  memo.set(url, { at: Date.now(), chunk });
+  return chunk;
 }
+const loadSeries = (sym, iv, first, fresh) => Promise.all(chunkQueries(sym, iv, first).map((q) => fetchChunk(q, fresh)));
 
-// 交易日（交易所时区）。美股 20:00 ET 之后的隔夜盘算下一个交易日。
-function tradeDay(epoch) {
-  const w = toWall(epoch, S.tz);
-  return dayOf(w) + (S.tz === 'America/New_York' && wd(w).H >= 20 ? DAY : 0);
-}
-function splitFactor(epochOrNull) {
-  if (epochOrNull == null) return 1;
-  const d = tradeDay(epochOrNull);
-  let f = 1; for (const s of S.splits) if (s.day > d) f *= s.ratio;
-  return f;
-}
 function mapToBar(epoch) {
   const bars = S.bars; if (!bars.length) return -1;
   if (!IV_SEC[S.iv]) {
@@ -399,14 +382,16 @@ function buildGroups() {
   const g = (i) => { let v = groups.get(i); if (!v) { v = { B: [], S: [], X: [], OB: [], OS: [] }; groups.set(i, v); } return v; };
   let out = 0;
   for (const t of x.trades) {
-    const f = splitFactor(t.epoch);
-    t.adjPrice = t.price / f; t.adjQty = t.qty * f; t._bar = mapToBar(t.epoch);
+    const d = tradeDay(t.epoch);
+    t.dispPrice = t.price * viewP(d); t.dispQty = t.qty * viewV(d); t.unitQty = t.qty * unitV(d);
+    t._bar = mapToBar(t.epoch);
     if (t._bar < 0) { out++; continue; }
     g(t._bar)[t.qty > 0 ? 'B' : 'S'].push(t);
   }
   for (const t of x.xfers) {
-    const f = splitFactor(t.epoch);
-    t.adjQty = t.qty * f; t.adjPrice = Math.abs(t.mval / t.qty) / f; t._bar = mapToBar(t.epoch);
+    const d = tradeDay(t.epoch);
+    t.dispPrice = Math.abs(t.mval / t.qty) * viewP(d); t.dispQty = t.qty * viewV(d); t.unitQty = t.qty * unitV(d);
+    t._bar = mapToBar(t.epoch);
     if (t._bar >= 0 && $('#tgXfer').checked) g(t._bar).X.push(t);
   }
   for (const t of x.opts) {
@@ -416,21 +401,25 @@ function buildGroups() {
   S.groups = groups; S.outOfRange = out;
 }
 
-// 持仓曲线：用最新账单的持仓倒推期初持仓，再按成交累加
+// 持仓曲线：用最新账单的持仓倒推期初持仓（按最新股数口径），不复权视图再换回当时的股数
 function buildPosition() {
   const x = S.insts.get(S.cur), n = S.bars.length;
   if (x.kind === 'fx' || !n) return null;
   const ev = [...x.trades, ...x.xfers];
-  const final = x.pos * splitFactor(x.posAsOf);
-  let base = final - sum(ev.map((e) => e.adjQty));
+  const final = x.pos * (x.posAsOf != null ? unitV(tradeDay(x.posAsOf)) : 1);
+  let base = final - sum(ev.map((e) => e.unitQty));
   const delta = new Float64Array(n);
   const firstT = S.bars[0].time;
   for (const e of ev) {
-    if (e._bar >= 0) delta[e._bar] += e.adjQty;
-    else if (toWall(e.epoch, S.tz) < firstT) base += e.adjQty;
+    if (e._bar >= 0) delta[e._bar] += e.unitQty;
+    else if (toWall(e.epoch, S.tz) < firstT) base += e.unitQty;
   }
   const out = new Array(n); let c = base;
-  for (let i = 0; i < n; i++) { c += delta[i]; out[i] = Math.abs(c) < 1e-6 ? 0 : c; }
+  for (let i = 0; i < n; i++) {
+    c += delta[i];
+    const v = qfq() ? c : c / unitV(dayOf(S.bars[i].time));
+    out[i] = Math.abs(v) < 1e-6 ? 0 : v;
+  }
   return out;
 }
 
@@ -441,6 +430,21 @@ function indicators(bars) {
   const e12 = ema(c, 12), e26 = ema(c, 26);
   const dif = c.map((_, i) => e12[i] - e26[i]), dea = ema(dif, 9);
   return { ma, dif, dea, macd: dif.map((v, i) => 2 * (v - dea[i])) };
+}
+
+// 按当前复权口径和周期生成要画的数据
+function applyView() {
+  S.daily = qfq() ? scaleBars(S.rawDaily, S.F.price, S.F.vol) : S.rawDaily;
+  if (S.iv === '1d') S.bars = S.daily;
+  else if (IV_SEC[S.iv]) S.bars = qfq() ? scaleBars(S.rawIntra || [], S.F.price, S.F.vol) : (S.rawIntra || []);
+  else S.bars = aggregate(S.daily, S.iv);
+  chart.applyOptions({ timeScale: { timeVisible: !!IV_SEC[S.iv] } });
+  buildGroups();
+  S.ind = indicators(S.bars);
+  S.pos = buildPosition();
+  setSeriesData();
+  drawCostLine();
+  dirty = true;
 }
 
 // ---------------------------------------------------------------- chart
@@ -516,7 +520,9 @@ function drawCostLine() {
   if (costLine) { candle.removePriceLine(costLine); costLine = null; }
   const x = S.insts.get(S.cur);
   if (!x || !S.bars.length || !$('#tgCost').checked || Math.abs(x.pos) < 1e-9 || !Number.isFinite(x.cost)) return;
-  costLine = candle.createPriceLine({ price: x.cost / splitFactor(x.posAsOf), color: css('--accent'), lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '成本' });
+  const d = tradeDay(x.posAsOf);
+  const price = qfq() ? x.cost * viewP(d) : x.cost / unitV(d);
+  costLine = candle.createPriceLine({ price, color: css('--accent'), lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '成本' });
 }
 function initialRange() {
   const n = S.bars.length, idx = [...S.groups.keys()];
@@ -581,7 +587,7 @@ function draw() {
         if (isBelow) { o += tiny(color, x, below + 2, true, key); below += 9; } else { o += tiny(color, x, above - 2, false, key); above -= 9; }
         return;
       }
-      const ys = stem ? list.map((t) => Y(t.adjPrice)).filter((y) => y != null) : [];
+      const ys = stem ? list.map((t) => Y(t.dispPrice)).filter((y) => y != null) : [];
       if (isBelow) {
         const cy = Math.max(below, ...ys) + 6 + s / 2;
         if (ys.length) o += `<line x1="${x}" y1="${Math.min(...ys)}" x2="${x}" y2="${cy - s / 2 - 4}" stroke="${color}" stroke-width="1" stroke-dasharray="2 2"/>`;
@@ -620,7 +626,7 @@ function tipHtml(key) {
       rows += `<tr><td>${tm}</td><td class="r num">${fmtS(t.qty, 0)} 股</td><td class="r num">市值 ${fmt(t.mval)}</td></tr>`;
     } else {
       const label = side.startsWith('O') ? `<td>${esc(t.sym.replace(x.key + ' ', ''))}</td>` : '';
-      const adj = !side.startsWith('O') && Math.abs(t.adjPrice - t.price) > 1e-9 ? ` <span class="muted">(复权 ${fmt(t.adjPrice, dg)})</span>` : '';
+      const adj = !side.startsWith('O') && Math.abs(t.dispPrice - t.price) > 1e-6 ? ` <span class="muted">(复权 ${fmt(t.dispPrice, dg)})</span>` : '';
       const rl = Number.isFinite(t.realized) && Math.abs(t.realized) > 1e-9 ? `<td class="r num ${cls(t.realized)}">${fmtS(t.realized)}</td>` : '<td></td>';
       rows += `<tr><td class="muted">${tm}</td>${label}<td class="r num">${fmtS(t.qty, Number.isInteger(t.qty) ? 0 : 4)}</td><td class="r num">@ ${esc(t.priceRaw || fmt(t.price, dg))}${adj}</td>${rl}</tr>`;
     }
@@ -654,11 +660,14 @@ function updateLegends(i) {
     <span>涨跌 <b class="num ${cls(ch)}">${fmtS(ch, dg)} (${fmtS((ch / prev) * 100)}%)</b></span><span>振幅 <b class="num">${fmt(((b.high - b.low) / prev) * 100)}%</b></span>
     <span>量 <b class="num">${fmtVol(b.volume)}</b></span>${srcLabel()}`;
 }
+const SOURCE_NAME = { HIT: '边缘缓存', REVALIDATED: '边缘缓存', UPDATING: '边缘缓存', STALE: '边缘缓存', MISS: 'Yahoo', EXPIRED: 'Yahoo', DYNAMIC: 'Yahoo', BYPASS: 'Yahoo', cache: '本地缓存', network: 'Yahoo', stale: '过期缓存' };
 function srcLabel() {
-  if (!S.src) return '';
-  const t = new Date(S.src.fetched_at * 1000), hm = `${t.getMonth() + 1}/${t.getDate()} ${pad(t.getHours())}:${pad(t.getMinutes())}`;
-  const txt = S.src.source === 'stale' ? `⚠ Yahoo 不可达，使用本地缓存 (${hm})` : S.src.source === 'cache' ? `行情：本地缓存 · ${hm} 更新` : `行情：Yahoo · ${hm} 更新`;
-  return `<span class="src" title="${esc(S.src.error || '')}">${txt}</span>`;
+  const cs = S.chunks.filter((c) => c.asOf);
+  if (!cs.length) return '';
+  const t = new Date(Math.max(...cs.map((c) => c.asOf)) * 1000);
+  const hm = `${t.getMonth() + 1}/${t.getDate()} ${pad(t.getHours())}:${pad(t.getMinutes())}`;
+  const names = [...new Set(cs.map((c) => SOURCE_NAME[c.source] || '浏览器缓存'))].join(' / ');
+  return `<span class="src">${S.adj === 'qfq' ? '前复权' : '不复权'} · 行情：${esc(names)} · 数据截至 ${hm}</span>`;
 }
 function onCrosshair(p) {
   if (!S.bars.length) return;
@@ -677,8 +686,8 @@ function renderTable() {
     const isX = t.mval !== undefined, isO = t.kind === 'option';
     const side = isX ? (t.qty > 0 ? 'XI' : 'XO') : isO ? (t.qty > 0 ? 'OB' : 'OS') : t.qty > 0 ? 'B' : 'S';
     const p = isX ? pill(t.qty > 0 ? '转入' : '转出', xferC) : isO ? pill(t.qty > 0 ? '买' + t.right : '卖' + t.right, optC) : pill(t.qty > 0 ? '买入' : '卖出', t.qty > 0 ? C.up : C.down);
-    const adjQ = t.adjQty !== undefined && Math.abs(t.adjQty - t.qty) > 1e-9 ? `<span class="adj">≈${fmtQ(t.adjQty)}</span>` : '';
-    const adjP = !isX && !isO && t.adjPrice !== undefined && Math.abs(t.adjPrice - t.price) > 1e-9 ? `<span class="adj">复权 ${fmt(t.adjPrice, dg)}</span>` : '';
+    const adjQ = t.dispQty !== undefined && Math.abs(t.dispQty - t.qty) > 1e-9 ? `<span class="adj">≈${fmtQ(t.dispQty)}</span>` : '';
+    const adjP = !isX && !isO && t.dispPrice !== undefined && Math.abs(t.dispPrice - t.price) > 1e-6 ? `<span class="adj">复权 ${fmt(t.dispPrice, dg)}</span>` : '';
     const rl = Number.isFinite(t.realized) && Math.abs(t.realized) > 1e-9 ? `<span class="${cls(t.realized)}">${fmtS(t.realized)}</span>` : '';
     return `<tr data-bar="${t._bar ?? -1}" data-side="${side}" class="${t._bar === undefined || t._bar >= 0 ? '' : 'off'}" title="${t._bar < 0 ? '不在当前周期的行情范围内' : '点击定位到图上'}">
       <td class="num">${dateStr(t.wall)} ${isX ? '' : timeStr(t.wall)}</td><td>${p}</td><td>${esc(isO ? t.sym : x.key)}</td>
@@ -690,40 +699,50 @@ function renderTable() {
 }
 
 // ---------------------------------------------------------------- flow
-let seq = 0;
+const REASON = {
+  per_client: '你的请求太频繁', global: '全站请求太多', daily_budget: '今日额度已用完',
+  upstream_cooldown: 'Yahoo 暂时限流，正在冷却', upstream: 'Yahoo 暂时限流',
+};
+let seq = 0, retryTimer = null;
 async function loadChart(refresh = false) {
   const my = ++seq, x = S.insts.get(S.cur), iv = S.iv;
   if (!x) return;
+  clearTimeout(retryTimer);
   $('#loading').style.display = 'flex';
   $('#notice').style.display = 'none';
   $('#notice').innerHTML = '';
   try {
-    const [dj, ij] = await Promise.all([
-      fetchSeries(x.yahoo, '1d', x.first - 3 * 365 * DAY, refresh),
-      IV_SEC[iv] ? fetchSeries(x.yahoo, iv, x.first - 5 * DAY, refresh) : null,
+    const [dChunks, iChunks] = await Promise.all([
+      loadSeries(x.yahoo, '1d', x.first, refresh),
+      IV_SEC[iv] ? loadSeries(x.yahoo, iv, x.first, refresh) : null,
     ]);
     if (my !== seq) return;
-    const D = toBars(dj, true);
-    S.daily = D.bars; S.tz = D.tz; S.splits = D.splits; S.meta = dj.meta;
-    S.bars = iv === '1d' ? D.bars : IV_SEC[iv] ? toBars(ij, false).bars : aggregate(D.bars, iv);
-    S.src = ij || dj;
-    if (!S.bars.length) throw new Error('Yahoo 没有返回这个代码的行情');
-    chart.applyOptions({ timeScale: { timeVisible: !!IV_SEC[iv] } });
-    buildGroups();
-    S.ind = indicators(S.bars); S.pos = buildPosition();
-    setSeriesData(); drawCostLine(); initialRange();
+    if (dChunks.every((c) => c.notFound)) throw new Error('Yahoo 上找不到这个代码');
+    const D = assemble(dChunks, true, iChunks ? iChunks.flatMap((c) => c.splits) : []);
+    if (!D.bars.length) throw new Error('Yahoo 没有返回这个代码的行情');
+    S.tz = D.tz; S.meta = D.meta; S.rawDaily = D.bars;
+    S.F = makeFactors(D.bars, D.splits, D.divs);
+    S.rawIntra = iChunks ? assemble(iChunks, false, D.splits).bars : null;
+    S.chunks = [...dChunks, ...(iChunks || [])];
+    applyView();
+    if (!S.bars.length) throw new Error('这个周期没有数据');
+    initialRange();
     renderHeader(); renderTable(); updateLegends(S.bars.length - 1);
-    const notes = [];
-    if (S.outOfRange) notes.push(`${S.outOfRange} 笔成交不在当前周期的行情范围内${IV_SEC[iv] ? '（Yahoo 的分钟线只能回溯 60 天 / 60 分钟线 2 年，本地缓存会逐渐积累）' : ''}，表格中以灰色显示。`);
-    if (S.splits.some((s) => x.trades.some((t) => tradeDay(t.epoch) < s.day))) notes.push('该股票期间有拆股，图上的买卖价已按拆股比例复权（表格中同时显示原价和复权价）。');
-    if (dj.source === 'stale') notes.push(`联网失败，正在使用本地缓存：${dj.error}`);
-    if (notes.length) { $('#notice').innerHTML = notes.map(esc).join('<br>'); $('#notice').style.display = 'block'; }
+    renderNotices();
   } catch (e) {
     if (my !== seq) return;
-    S.bars = []; S.groups = new Map();
+    S.bars = []; S.groups = new Map(); S.chunks = [];
     [candle, ...maS, vol, macdH, difS, deaS, posS].forEach((s) => s.setData([]));
     $('#info').innerHTML = '';
-    $('#notice').innerHTML = `行情载入失败（${esc(x.yahoo)}）：${esc(e.message)}<br>如果代码对不上，可以在标题旁的 Yahoo 输入框里改成 Yahoo 上的代码。`;
+    let msg;
+    if (e.status === 429 || e.status === 503) {
+      const wait = Math.max(1, Math.round(e.retryAfter || 30));
+      msg = `行情服务限流中（${REASON[e.reason] || '请求太多'}），约 ${wait} 秒后可以重试。已经看过的代码会走缓存，不受影响。`;
+      if (wait <= 20) retryTimer = setTimeout(() => { if (my === seq) loadChart(); }, wait * 1000 + 300);
+    } else {
+      msg = `行情载入失败（${x.yahoo}）：${e.message}。如果代码对不上，可以在标题旁的 Yahoo 输入框里改成 Yahoo 上的代码。`;
+    }
+    $('#notice').textContent = msg;
     $('#notice').style.display = 'block';
     renderHeader(); renderTable();
   } finally {
@@ -731,11 +750,28 @@ async function loadChart(refresh = false) {
   }
 }
 
+function renderNotices() {
+  const x = S.insts.get(S.cur);
+  const notes = [];
+  if (S.outOfRange) notes.push(`${S.outOfRange} 笔成交不在当前周期的行情范围内${IV_SEC[S.iv] ? '（Yahoo 的 30 分线只有最近 60 天，60 分线约 2 年）' : ''}，表格中以灰色显示。`);
+  const splits = S.F ? S.F.events.filter((e) => e.kind === 'split' && e.day > tradeDay(x.first)) : [];
+  if (splits.length) {
+    const desc = splits.map((e) => `${dateStr(e.day)} ${e.ratio >= 1 ? `1 拆 ${fmtQ(e.ratio)}` : `${fmtQ(1 / e.ratio)} 合 1`}`).join('、');
+    notes.push(S.adj === 'qfq'
+      ? `期间有拆股（${desc}）。当前为前复权：K 线和买卖点按同一因子换算，表格同时显示原始成交价。`
+      : `期间有拆股（${desc}）。当前为不复权：显示原始价格和股数，拆股当天价格会跳变。`);
+  }
+  if (S.chunks.some((c) => c.source === 'stale')) notes.push('联网失败，部分数据来自过期的本地缓存。');
+  $('#notice').textContent = '';
+  $('#notice').innerHTML = notes.map(esc).join('<br>');
+  $('#notice').style.display = notes.length ? 'block' : 'none';
+}
+
 function select(key) {
   if (!S.insts.has(key)) return;
   S.cur = key; store.set('sym', key);
   document.querySelectorAll('#symlist li[data-k]').forEach((li) => li.classList.toggle('on', li.dataset.k === key));
-  S.meta = {}; S.daily = []; S.splits = [];
+  S.meta = {}; S.rawDaily = []; S.F = null;
   renderHeader(); renderTable();
   loadChart();
 }
@@ -776,6 +812,9 @@ async function loadFiles(files) {
 function showDropError(m) { const el = $('#dropErr'); el.textContent = m; el.style.display = 'block'; $('#drop').classList.add('show'); }
 
 // ---------------------------------------------------------------- events
+function setTabs(sel, attr, value) {
+  document.querySelectorAll(`${sel} button`).forEach((b) => b.classList.toggle('on', b.dataset[attr] === value));
+}
 function bind() {
   $('#pickBtn').onclick = () => $('#file').click();
   $('#addBtn').onclick = () => $('#file').click();
@@ -799,8 +838,18 @@ function bind() {
   $('#tabs').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-iv]'); if (!b || b.dataset.iv === S.iv) return;
     S.iv = b.dataset.iv; store.set('iv', S.iv);
-    document.querySelectorAll('#tabs button').forEach((x) => x.classList.toggle('on', x === b));
+    setTabs('#tabs', 'iv', S.iv);
     loadChart();
+  });
+  $('#adjTabs').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-adj]'); if (!b || b.dataset.adj === S.adj) return;
+    S.adj = b.dataset.adj; store.set('adj', S.adj);
+    setTabs('#adjTabs', 'adj', S.adj);
+    if (!S.rawDaily.length) return;
+    const r = chart.timeScale().getVisibleLogicalRange();
+    applyView();
+    if (r) chart.timeScale().setVisibleLogicalRange(r);
+    renderTable(); updateLegends(S.bars.length - 1); renderNotices();
   });
   $('#refreshBtn').onclick = () => loadChart(true);
   $('#ysym').addEventListener('keydown', (e) => {
@@ -858,16 +907,15 @@ async function boot() {
   $('#tgRedUp').checked = store.get('redUp', false);
   $('#tgCost').checked = store.get('cost', true);
   $('#tgHiLo').checked = store.get('hilo', true);
-  document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('on', b.dataset.iv === S.iv));
-  if (!LWC) { showDropError('图表库没加载出来（需要能访问 unpkg.com）。'); return; }
+  setTabs('#tabs', 'iv', S.iv);
+  setTabs('#adjTabs', 'adj', S.adj);
+  if (!LWC) { showDropError('图表库没加载出来。'); return; }
   makeChart(); bind(); loop();
   window.__ibv = { S, get chart() { return chart; }, get candle() { return candle; } };   // 调试用
-  if (location.protocol === 'file:') { showDropError('请用 python3 server.py 启动后再打开页面，否则拿不到行情数据。'); return; }
   try {
-    const r = await fetch('/api/statements');
+    const r = await fetch('/api/statements');   // 只有本地 server.py 带账单启动时才有
     const list = r.ok ? await r.json() : [];
-    if (list.length) await loadTexts(list);
-  } catch (e) { showDropError(e.message); }
+    if (Array.isArray(list) && list.length) await loadTexts(list);
+  } catch { /* 没有自动载入的账单 */ }
 }
 boot();
-})();

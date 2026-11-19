@@ -173,10 +173,13 @@ table.trades tbody tr.off { opacity: .5; }
       <button data-iv="1wk">周K</button>
       <button data-iv="1mo">月K</button>
       <button data-iv="60m">60分</button>
-      <button data-iv="15m">15分</button>
-      <button data-iv="5m">5分</button>
+      <button data-iv="30m">30分</button>
     </div>
-    <button class="btn" id="refreshBtn" title="跳过缓存，立即从 Yahoo 拉最新行情">↻ 刷新行情</button>
+    <div class="tabs" id="adjTabs" title="前复权：按拆股和分红调整历史价格；不复权：显示原始成交价">
+      <button data-adj="qfq" class="on">前复权</button>
+      <button data-adj="none">不复权</button>
+    </div>
+    <button class="btn" id="refreshBtn" title="重新获取最近一段行情（历史部分不会变，始终走缓存）">↻ 刷新</button>
     <div class="toggles">
       <label><input type="checkbox" id="tgOpt" checked>期权</label>
       <label><input type="checkbox" id="tgXfer" checked>转入/转出</label>
@@ -218,7 +221,7 @@ table.trades tbody tr.off { opacity: .5; }
 <div id="drop" class="show">
   <div class="dropbox">
     <h2>拖入 IBKR 活动账单 CSV</h2>
-    <p>文件只在本地浏览器里解析，不会上传。行情来自 Yahoo Finance（只发送股票代码）。</p>
+    <p>账单只在你的浏览器里解析，不会上传到任何服务器。行情来自 Yahoo Finance，请求里只有股票代码和时间范围。</p>
     <ol>
       <li>IBKR 网页端 → <code>业绩和报告</code> → <code>报表</code> → <code>活动</code></li>
       <li>选择期间（可选“自定义日期范围”），格式选 <code>CSV</code>，下载</li>
@@ -230,7 +233,7 @@ table.trades tbody tr.off { opacity: .5; }
 </div>
 <input type="file" id="file" accept=".csv,text/csv" multiple hidden>
 
-<script src="https://unpkg.com/lightweight-charts@5.0.8/dist/lightweight-charts.standalone.production.js"></script>
-<script src="app.js"></script>
+<script src="vendor/lightweight-charts.standalone.production.js"></script>
+<script type="module" src="app.js"></script>
 </body>
 </html>

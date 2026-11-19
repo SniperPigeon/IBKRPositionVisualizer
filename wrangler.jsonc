@@ -1,0 +1,38 @@
+// IBKR 交易回看 — Workers + Static Assets
+//   npm install
+//   npm run dev       # 本地：http://localhost:8787（行情从本机出口拉）
+//   npm run deploy    # 部署（第一次需要 npx wrangler login）
+{
+	"name": "ibkr-trade-viz",
+	"main": "worker/index.js",
+	"compatibility_date": "2026-11-01",
+	"workers_dev": true,
+	"preview_urls": false,
+
+	// 页面和前端脚本直接作为静态资源返回，只有 /api/* 进 Worker
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS",
+		"run_worker_first": ["/api/*"]
+	},
+
+	// Workers Caching：按响应的 Cache-Control 缓存 /api/chart，命中时 Worker 不运行。
+	// 早期频繁部署，先不跨版本共享缓存；稳定后可以打开 cross_version_cache。
+	"cache": { "enabled": true, "cross_version_cache": false },
+
+	"durable_objects": {
+		"bindings": [{ "name": "GATE", "class_name": "YahooGate" }]
+	},
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["YahooGate"] }],
+
+	// 限流参数（只作用于缓存未命中、需要回源 Yahoo 的请求）
+	"vars": {
+		"GATE_RATE": "3",
+		"GATE_BURST": "30",
+		"GATE_DAILY": "4000",
+		"IP_RATE": "0.5",
+		"IP_BURST": "15"
+	},
+
+	"observability": { "enabled": true }
+}

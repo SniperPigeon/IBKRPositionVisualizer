@@ -1,0 +1,15 @@
+// Yahoo-from-Workers 冒烟测试（见 src/index.js 顶部说明）
+// 首次部署是通过 Cloudflare API 完成的；之后也可以用：
+//   npx wrangler@4.157.0 deploy
+//   npx wrangler@4.157.0 secret put PROBE_KEY   # 值在 .dev.vars（已 gitignore）
+// 测完可以删掉：npx wrangler@4.157.0 delete，并删除 KV namespace ibkr-yahoo-smoke-results
+{
+	"name": "ibkr-yahoo-smoke",
+	"main": "src/index.js",
+	"compatibility_date": "2026-11-01",
+	"workers_dev": true,
+	"preview_urls": false,
+	"triggers": { "crons": ["*/10 * * * *"] },
+	"kv_namespaces": [{ "binding": "RESULTS", "id": "809fb75a970e4fc8b66fefa07fd47a00" }],
+	"observability": { "enabled": true }
+}

@@ -1,0 +1,16 @@
+# 行情缓存（本地生成）
+cache/
+
+# 账单等私人数据，绝不提交
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+
+# Node / Cloudflare
+node_modules/
+.wrangler/
+.dev.vars
+
+.DS_Store

@@ -131,7 +131,7 @@ function parseFlat(rows, name) {
     p: f('tradeprice', 'price'), a: f('assetclass', 'assetcategory'), c: f('currencyprimary', 'currency'), comm: f('ibcommission', 'commission', 'commfee'),
     r: f('fifopnlrealized', 'realizedpnl', 'realizedpl'), pr: f('proceeds'), code: f('notescodes', 'code', 'opencloseindicator'),
     bs: f('buysell'), lvl: f('levelofdetail'), u: f('underlyingsymbol') };
-  if (I.sym < 0 || I.q < 0 || I.p < 0 || (I.dt < 0 && I.d < 0)) throw new Error(`${name}：不是 IBKR 活动账单，也找不到 Symbol / Quantity / TradePrice / Date 列`);
+  if (I.sym < 0 || I.q < 0 || I.p < 0 || (I.dt < 0 && I.d < 0)) throw new Error(`${name}：无法识别。请上传从 IBKR 导出的活动账单（CSV 格式）。`);
   const res = { name, trades: [], transfers: [], positions: [], info: [], account: {} };
   const hdrKey = H.join(',');
   for (const r of rows.slice(1)) {
@@ -674,14 +674,12 @@ function updateLegends(i) {
     <span>涨跌 <b class="num ${cls(ch)}">${fmtS(ch, dg)} (${fmtS((ch / prev) * 100)}%)</b></span><span>振幅 <b class="num">${fmt(((b.high - b.low) / prev) * 100)}%</b></span>
     <span>量 <b class="num">${fmtVol(b.volume)}</b></span>${srcLabel()}`;
 }
-const SOURCE_NAME = { HIT: '边缘缓存', REVALIDATED: '边缘缓存', UPDATING: '边缘缓存', STALE: '边缘缓存', MISS: 'Yahoo', EXPIRED: 'Yahoo', DYNAMIC: 'Yahoo', BYPASS: 'Yahoo', cache: '本地缓存', network: 'Yahoo', stale: '过期缓存' };
 function srcLabel() {
   const cs = S.chunks.filter((c) => c.asOf);
   if (!cs.length) return '';
   const t = new Date(Math.max(...cs.map((c) => c.asOf)) * 1000);
   const hm = `${t.getMonth() + 1}/${t.getDate()} ${pad(t.getHours())}:${pad(t.getMinutes())}`;
-  const names = [...new Set(cs.map((c) => SOURCE_NAME[c.source] || '浏览器缓存'))].join(' / ');
-  return `<span class="src">${S.adj === 'qfq' ? '前复权' : '不复权'} · 行情：${esc(names)} · 数据截至 ${hm}</span>`;
+  return `<span class="src">${S.adj === 'qfq' ? '前复权' : '不复权'} · 数据来自 Yahoo Finance · 截至 ${hm}</span>`;
 }
 function onCrosshair(p) {
   if (!S.bars.length) return;
@@ -713,10 +711,12 @@ function renderTable() {
 }
 
 // ---------------------------------------------------------------- flow
-const REASON = {
-  per_client: '你的请求太频繁', global: '全站请求太多', daily_budget: '今日额度已用完',
-  upstream_cooldown: 'Yahoo 暂时限流，正在冷却', upstream: 'Yahoo 暂时限流',
+const BUSY_REASON = {
+  per_client: '操作有点频繁', global: '当前访问的人较多', daily_budget: '今天的行情查询次数已达上限',
+  upstream_cooldown: '行情数据源暂时繁忙', upstream: '行情数据源暂时繁忙',
 };
+const waitText = (s) => (s < 90 ? `${s} 秒` : s < 5400 ? `${Math.round(s / 60)} 分钟` : `${Math.round(s / 3600)} 小时`);
+const userError = (msg, extra) => Object.assign(new Error(msg), extra);
 let seq = 0, retryTimer = null;
 async function loadChart(refresh = false) {
   const my = ++seq, x = S.insts.get(S.cur), iv = S.iv;
@@ -731,15 +731,15 @@ async function loadChart(refresh = false) {
       IV_SEC[iv] ? loadSeries(x.yahoo, iv, x.first, refresh) : null,
     ]);
     if (my !== seq) return;
-    if (dChunks.every((c) => c.notFound)) throw new Error('Yahoo 上找不到这个代码');
+    if (dChunks.every((c) => c.notFound)) throw userError('not found', { notFound: true });
     const D = assemble(dChunks, true, iChunks ? iChunks.flatMap((c) => c.splits) : []);
-    if (!D.bars.length) throw new Error('Yahoo 没有返回这个代码的行情');
+    if (!D.bars.length) throw userError('no data', { notFound: true });
     S.tz = D.tz; S.meta = D.meta; S.rawDaily = D.bars;
     S.F = makeFactors(D.bars, D.splits, D.divs);
     S.rawIntra = iChunks ? assemble(iChunks, false, D.splits).bars : null;
     S.chunks = [...dChunks, ...(iChunks || [])];
     applyView();
-    if (!S.bars.length) throw new Error('这个周期没有数据');
+    if (!S.bars.length) throw userError('empty interval', { empty: true });
     initialRange();
     renderHeader(); renderTable(); updateLegends(S.bars.length - 1);
     renderNotices();
@@ -748,13 +748,19 @@ async function loadChart(refresh = false) {
     S.bars = []; S.groups = new Map(); S.chunks = [];
     [candle, ...maS, vol, macdH, difS, deaS, posS].forEach((s) => s.setData([]));
     $('#info').innerHTML = '';
+    console.warn('[行情]', x.yahoo, iv, e);
     let msg;
     if (e.status === 429 || e.status === 503) {
       const wait = Math.max(1, Math.round(e.retryAfter || 30));
-      msg = `行情服务限流中（${REASON[e.reason] || '请求太多'}），约 ${wait} 秒后可以重试。已经看过的代码会走缓存，不受影响。`;
-      if (wait <= 20) retryTimer = setTimeout(() => { if (my === seq) loadChart(); }, wait * 1000 + 300);
+      const auto = wait <= 20;
+      msg = `${BUSY_REASON[e.reason] || '行情暂时无法获取'}，约 ${waitText(wait)}后${auto ? '会自动重试' : '再试'}。已经看过的股票不受影响。`;
+      if (auto) retryTimer = setTimeout(() => { if (my === seq) loadChart(); }, wait * 1000 + 300);
+    } else if (e.notFound || e.status === 404) {
+      msg = `找不到 ${x.yahoo} 的行情。如果代码不对，可以在标题旁的 Yahoo 输入框里改成 Yahoo Finance 上的代码。`;
+    } else if (e.empty) {
+      msg = '这个周期没有行情数据。';
     } else {
-      msg = `行情载入失败（${x.yahoo}）：${e.message}。如果代码对不上，可以在标题旁的 Yahoo 输入框里改成 Yahoo 上的代码。`;
+      msg = '行情暂时获取失败，请稍后点「刷新」重试。';
     }
     $('#notice').textContent = msg;
     $('#notice').style.display = 'block';
@@ -765,17 +771,9 @@ async function loadChart(refresh = false) {
 }
 
 function renderNotices() {
-  const x = S.insts.get(S.cur);
   const notes = [];
-  if (S.outOfRange) notes.push(`${S.outOfRange} 笔成交不在当前周期的行情范围内${IV_SEC[S.iv] ? '（Yahoo 的 30 分线只有最近 60 天，60 分线约 2 年）' : ''}，表格中以灰色显示。`);
-  const splits = S.F ? S.F.events.filter((e) => e.kind === 'split' && e.day > tradeDay(x.first)) : [];
-  if (splits.length) {
-    const desc = splits.map((e) => `${dateStr(e.day)} ${e.ratio >= 1 ? `1 拆 ${fmtQ(e.ratio)}` : `${fmtQ(1 / e.ratio)} 合 1`}`).join('、');
-    notes.push(S.adj === 'qfq'
-      ? `期间有拆股（${desc}）。当前为前复权：K 线和买卖点按同一因子换算，表格同时显示原始成交价。`
-      : `期间有拆股（${desc}）。当前为不复权：显示原始价格和股数，拆股当天价格会跳变。`);
-  }
-  if (S.chunks.some((c) => c.source === 'stale')) notes.push('联网失败，部分数据来自过期的本地缓存。');
+  if (S.outOfRange) notes.push(`${S.outOfRange} 笔成交不在当前周期可查看的范围内${IV_SEC[S.iv] ? '（30 分线只能看最近 60 天，60 分线约 2 年）' : ''}，表格中以灰色显示。`);
+  if (S.chunks.some((c) => c.source === 'stale')) notes.push('暂时无法获取最新行情，部分数据可能不是最新的。');
   $('#notice').textContent = '';
   $('#notice').innerHTML = notes.map(esc).join('<br>');
   $('#notice').style.display = notes.length ? 'block' : 'none';
@@ -812,7 +810,7 @@ async function loadTexts(list) {
     try { ingest(parseStatement(content, name)); } catch (e) { err.push(e.message); }
   }
   buildInstruments();
-  if (!S.insts.size) throw new Error(err[0] || '文件里没有找到成交记录（需要包含“交易 / Trades”部分的活动账单）');
+  if (!S.insts.size) throw new Error(err[0] || '没有在文件里找到成交记录。请确认导出的是包含「交易」部分的活动账单（CSV 格式）。');
   renderAcct(); renderSide();
   $('#drop').classList.remove('show');
   const want = S.cur && S.insts.has(S.cur) ? S.cur : store.get('sym', null);
@@ -929,7 +927,7 @@ async function boot() {
   setTabs('#tabs', 'iv', S.iv);
   setTabs('#adjTabs', 'adj', S.adj);
   renderPrivBtn();
-  if (!LWC) { showDropError('图表库没加载出来。'); return; }
+  if (!LWC) { showDropError('页面没有完整加载，请刷新重试。'); return; }
   makeChart(); bind(); loop();
   window.__ibv = { S, get chart() { return chart; }, get candle() { return candle; } };   // 调试用
   try {

@@ -152,7 +152,7 @@ table.trades tbody tr.off { opacity: .5; }
   <div class="search"><input id="q" placeholder="搜索代码…" autocomplete="off" spellcheck="false"></div>
   <ul id="symlist"></ul>
   <div class="side-foot">
-    <button class="btn" id="addBtn" title="追加另一份账单 CSV（会自动去重）">＋ 追加 CSV</button>
+    <button class="btn" id="addBtn" title="追加另一份账单（重复的成交只计一次）">＋ 追加 CSV</button>
     <button class="btn" id="themeBtn" title="切换深色/浅色">◐</button>
   </div>
 </aside>
@@ -188,7 +188,7 @@ table.trades tbody tr.off { opacity: .5; }
       <button data-adj="qfq" class="on">前复权</button>
       <button data-adj="none">不复权</button>
     </div>
-    <button class="btn" id="refreshBtn" title="重新获取最近一段行情（历史部分不会变，始终走缓存）">↻ 刷新</button>
+    <button class="btn" id="refreshBtn" title="重新获取最近一段行情">↻ 刷新</button>
     <div class="toggles">
       <label><input type="checkbox" id="tgOpt" checked>期权</label>
       <label><input type="checkbox" id="tgXfer" checked>转入/转出</label>
@@ -230,11 +230,11 @@ table.trades tbody tr.off { opacity: .5; }
 <div id="drop" class="show">
   <div class="dropbox">
     <h2>拖入 IBKR 活动账单 CSV</h2>
-    <p>账单只在你的浏览器里解析，不会上传到任何服务器。行情来自 Yahoo Finance，请求里只有股票代码和时间范围。</p>
+    <p>账单只在你的浏览器里解析，不会上传到任何服务器。行情来自 Yahoo Finance，查询时只会发送股票代码和日期范围。</p>
     <ol>
       <li>IBKR 网页端 → <code>业绩和报告</code> → <code>报表</code> → <code>活动</code></li>
       <li>选择期间（可选“自定义日期范围”），格式选 <code>CSV</code>，下载</li>
-      <li>拖到这里，或点下方按钮选择文件；多份账单可以一起选，会自动去重</li>
+      <li>拖到这里，或点下方按钮选择文件；多份账单可以一起选，重复的成交只计一次</li>
     </ol>
     <button class="btn primary" id="pickBtn">选择 CSV 文件</button>
     <div class="err" id="dropErr"></div>

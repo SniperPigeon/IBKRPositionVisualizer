@@ -6,8 +6,10 @@
 	"name": "ibkr-trade-viz",
 	"main": "worker/index.js",
 	"compatibility_date": "2026-11-01",
-	"workers_dev": true,
+	// 只通过自定义域名提供服务；workers.dev 地址会暴露账号子域名，关闭
+	"workers_dev": false,
 	"preview_urls": false,
+	"routes": [{ "pattern": "ibtradeviz.sniperpigeon.com", "custom_domain": true }],
 
 	// 页面和前端脚本直接作为静态资源返回，只有 /api/* 进 Worker
 	"assets": {
@@ -17,8 +19,9 @@
 	},
 
 	// Workers Caching：按响应的 Cache-Control 缓存 /api/chart，命中时 Worker 不运行。
-	// 早期频繁部署，先不跨版本共享缓存；稳定后可以打开 cross_version_cache。
-	"cache": { "enabled": true, "cross_version_cache": false },
+	// cross_version_cache：每次部署（CI 在每次推送 main 后自动部署）不清空缓存，历史块不必重拉。
+	// 响应格式变化时，改 public/lib/chunks.js 的 CHUNK_VERSION（URL 里的 v=），旧缓存自然失效。
+	"cache": { "enabled": true, "cross_version_cache": true },
 
 	"durable_objects": {
 		"bindings": [{ "name": "GATE", "class_name": "YahooGate" }]

@@ -156,10 +156,22 @@ const S = {
   insts: new Map(), cur: null,
   iv: IVS.includes(store.get('iv', '1d')) ? store.get('iv', '1d') : '1d',
   adj: store.get('adj', 'qfq') === 'none' ? 'none' : 'qfq',
+  priv: store.get('priv', false) === true,   // 截图模式：顶栏隐藏持仓数量和盈亏金额
   rawDaily: [], rawIntra: null, F: null, daily: [], bars: [], tz: STATEMENT_TZ, meta: {}, chunks: [],
   groups: new Map(), ind: null, pos: null, hl: null, outOfRange: 0,
 };
 const overrides = store.get('yahoo', {});
+const MASK = '****';
+const EYE_ICON = {
+  on: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>',
+  off: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.4 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2"/><path d="M6.6 6.6C3.9 8.4 2 12 2 12s3.6 7 10 7a9.9 9.9 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>',
+};
+function renderPrivBtn() {
+  const b = $('#privBtn');
+  b.innerHTML = S.priv ? EYE_ICON.off : EYE_ICON.on;
+  b.setAttribute('aria-pressed', String(S.priv));
+  b.title = S.priv ? '截图模式已开启：点击重新显示金额' : '截图模式：隐藏持仓数量和盈亏金额（保留笔数、胜率）';
+}
 
 function ingest(res) {
   const gen = parseWall(res.account.WhenGenerated || res.account['生成时间']) || Date.now() / 1000;
@@ -262,9 +274,10 @@ function renderAcct() {
   const n = sum(all.map((x) => x.trades.length + x.opts.length));
   const wins = sum(all.map((x) => x.wins)), closes = sum(all.map((x) => x.closes));
   const pl = Object.entries(byCur).filter(([, v]) => Math.abs(v) > 0.005)
-    .map(([c, v]) => `<b class="num ${cls(v)}">${fmtS(v)}</b> ${esc(c)}`).join(' · ') || '<b>0</b>';
+    .map(([c, v]) => (S.priv ? `<b class="num">${MASK}</b> ${esc(c)}` : `<b class="num ${cls(v)}">${fmtS(v)}</b> ${esc(c)}`))
+    .join(' · ') || `<b>${S.priv ? MASK : '0'}</b>`;
   $('#acct').innerHTML = `
-    <div class="row"><span>${esc(masked)}${a['基础货币'] || a['Base Currency'] ? ' · ' + esc(a['基础货币'] || a['Base Currency']) : ''}</span><span>${S.files.length} 份账单</span></div>
+    <div class="row"><span>${S.priv ? '••••' : esc(masked)}${a['基础货币'] || a['Base Currency'] ? ' · ' + esc(a['基础货币'] || a['Base Currency']) : ''}</span><span>${S.files.length} 份账单</span></div>
     <div>${esc(a.Period || a['期间'] || '')}</div>
     <div class="row"><span>已实现</span><span>${pl}</span></div>
     <div class="row"><span>成交 <b class="num">${n}</b> 笔</span><span>胜率 <b class="num">${closes ? Math.round((wins / closes) * 100) : '--'}%</b> <span class="muted">(${wins}/${closes})</span></span></div>`;
@@ -314,16 +327,17 @@ function renderHeader() {
   if (x.kind !== 'fx') {
     const last = n ? d[n - 1].close : NaN;
     const hold = Math.abs(x.pos) > 1e-9;
-    st.push(['持仓', hold ? `${fmtQ(x.pos)} 股` : '已清仓', '']);
+    st.push(['持仓', hold ? `${S.priv ? MASK : fmtQ(x.pos)} 股` : '已清仓', '']);
     if (hold && Number.isFinite(x.cost)) {
       // 账单里的成本价是账单日的原始价；若之后又拆股，换算成最新股数口径
       const u = unitV(tradeDay(x.posAsOf));
       const cost = x.cost / u, upl = (last - cost) * x.pos * u;
       st.push(['成本', fmt(cost, dg), '']);
-      st.push(['浮动盈亏', `${fmtS(upl)} (${fmtS((last / cost - 1) * 100)}%)`, cls(upl)]);
+      // 截图模式只隐藏金额，保留收益率
+      st.push(['浮动盈亏', `${S.priv ? MASK : fmtS(upl)} (${fmtS((last / cost - 1) * 100)}%)`, cls(upl)]);
     }
-    st.push(['已实现', fmtS(x.realized), cls(x.realized)]);
-    if (x.opts.length) st.push(['期权已实现', fmtS(x.optRealized), cls(x.optRealized)]);
+    st.push(['已实现', S.priv ? MASK : fmtS(x.realized), S.priv ? '' : cls(x.realized)]);
+    if (x.opts.length) st.push(['期权已实现', S.priv ? MASK : fmtS(x.optRealized), S.priv ? '' : cls(x.optRealized)]);
   }
   st.push(['成交', `${x.trades.length + x.opts.length} 笔`, '']);
   if (x.closes) st.push(['胜率', `${Math.round((x.wins / x.closes) * 100)}% (${x.wins}/${x.closes})`, '']);
@@ -852,6 +866,11 @@ function bind() {
     renderTable(); updateLegends(S.bars.length - 1); renderNotices();
   });
   $('#refreshBtn').onclick = () => loadChart(true);
+  $('#privBtn').onclick = () => {
+    S.priv = !S.priv; store.set('priv', S.priv);
+    renderPrivBtn();
+    if (S.insts.size) { renderAcct(); renderHeader(); }
+  };
   $('#ysym').addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
     const x = S.insts.get(S.cur), v = e.target.value.trim().toUpperCase(); if (!x || !v) return;
@@ -909,6 +928,7 @@ async function boot() {
   $('#tgHiLo').checked = store.get('hilo', true);
   setTabs('#tabs', 'iv', S.iv);
   setTabs('#adjTabs', 'adj', S.adj);
+  renderPrivBtn();
   if (!LWC) { showDropError('图表库没加载出来。'); return; }
   makeChart(); bind(); loop();
   window.__ibv = { S, get chart() { return chart; }, get candle() { return candle; } };   // 调试用

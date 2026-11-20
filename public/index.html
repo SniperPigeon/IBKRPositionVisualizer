@@ -67,6 +67,11 @@ main { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height:
 .ysym { display: inline-flex; align-items: center; gap: 4px; color: var(--faint); font-size: 11.5px; }
 .ysym input { width: 82px; padding: 1px 5px; border: 1px solid transparent; border-radius: 5px; background: transparent; color: var(--muted); font-size: 11.5px; }
 .ysym input:hover, .ysym input:focus { border-color: var(--line); outline: none; }
+.head-right { display: flex; align-items: flex-end; gap: 14px; }
+.eye-btn { flex: none; width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; padding: 0; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--muted); cursor: pointer; }
+.eye-btn:hover { color: var(--text); border-color: var(--muted); }
+.eye-btn[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+.eye-btn svg { width: 17px; height: 17px; }
 .stats { display: flex; gap: 18px; flex-wrap: wrap; }
 .stat { display: flex; flex-direction: column; align-items: flex-end; }
 .stat .k { color: var(--muted); font-size: 11.5px; }
@@ -135,6 +140,7 @@ table.trades tbody tr.off { opacity: .5; }
   #chartWrap { margin: 4px 4px 0 16px; height: 620px; }
   .toggles { margin-left: 0; }
   .stats { gap: 12px; }
+  .head-right { width: 100%; justify-content: space-between; }
   .stat { align-items: flex-start; }
 }
 </style>
@@ -164,7 +170,10 @@ table.trades tbody tr.off { opacity: .5; }
         <span class="ysym">Yahoo <input id="ysym" spellcheck="false" title="行情代码对不上时可以手动改，回车生效"></span>
       </div>
     </div>
-    <div class="stats" id="stats"></div>
+    <div class="head-right">
+      <div class="stats" id="stats"></div>
+      <button class="eye-btn" id="privBtn" type="button" aria-pressed="false" title="截图模式：隐藏持仓数量和盈亏金额"></button>
+    </div>
   </div>
 
   <div id="toolbar">

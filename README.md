@@ -2,6 +2,8 @@
 
 把 IBKR 活动账单（Activity Statement CSV）里的买卖点标到 K 线上回看，风格参考富途。
 
+在线使用：https://ibtradeviz.sniperpigeon.com
+
 - 账单只在浏览器里解析，不会上传；行情来自 Yahoo Finance，请求里只有代码和时间范围
 - 日K / 周K / 月K / 60分 / 30分，前复权 / 不复权（拆股 + 分红）
 - B/S 标记连到实际成交价，悬停看明细；期权成交和持仓转入标在正股上

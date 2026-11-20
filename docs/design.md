@@ -52,6 +52,8 @@ Yahoo 的 OHLC 和股息金额做过拆股调整（没有做股息调整），�
 - Workers Static Assets 提供 `public/`，只有 `/api/*` 进 Worker（`run_worker_first`）
 - `/api/chart` 原样透传 Yahoo 的 JSON，不解析（免费版每次请求只有 10ms CPU）
 - 开启 Workers Caching，按响应的 `Cache-Control` 缓存；命中时 Worker 不运行
+- 开启 `cross_version_cache`：CI 每次推送 main 都会部署，但缓存不随部署清空。响应格式变化时改 `CHUNK_VERSION`（URL 里的 `v=`），旧缓存自然失效
+- 只通过自定义域名提供服务（`routes` 里的 `custom_domain`），`workers_dev` 关闭
 - 每次缓存未命中都要经过 `YahooGate`（全站唯一的 Durable Object）：
   - 全局令牌桶 + 每个客户端（IPv4 / IPv6 /64）的令牌桶
   - 每天（UTC）发往 Yahoo 的上限
